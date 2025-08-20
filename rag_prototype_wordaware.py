@@ -1,12 +1,53 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Env knobs to reduce TF/Flax noise and CUDA fragmentation (helpful in Colab)
+
+
+from __future__ import annotations
+import argparse
+import json
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Dict, Any, Tuple, Optional
+
+import docx
+from razdel import sentenize, tokenize
+from rank_bm25 import BM25Okapi
+import numpy as np
+
+from sentence_transformers import SentenceTransformer, CrossEncoder
+import faiss
+import logging
+import warnings
+
+# minimal logger (уровень/формат зададим в main)
+logger = logging.getLogger("rag")
+
+# игнорируем Python warnings и глушим болтливость transformers
+warnings.filterwarnings("ignore")
+# noinspection PyBroadException
+try:
+    from transformers.utils import logging as hf_logging
+    hf_logging.set_verbosity_error()
+except Exception:
+    pass
+
+import os
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 """
 RAG prototype for Russian normative DOCX documents with:
 - Word-aware & table-aware chunking (sentences/clauses, no mid-word breaks)
 - Hybrid retrieval: BM25 (lexical, ru) + FAISS (dense, multilingual-e5)
 - Reciprocal Rank Fusion (RRF) merge
 - Cross-encoder re-ranking (Jina multilingual reranker)
-- Open-source LLM generation (Qwen2.5-7B-Instruct via Ollama or Transformers)
+- Open-source LLM generation (Qwen2.5-3B-Instruct via Ollama or Transformers)
 - Deterministic, citation-first JSON answers with doc + clause/table locators
 
 Run (local minimal):
@@ -15,27 +56,10 @@ Run (local minimal):
   # Optional HF 4-bit on Colab: bitsandbytes accelerate
 
 Examples:
-  python RAG_prototype_wordaware.py --data_dir ./docs --questions_file ./questions.txt --backend ollama --model Qwen2.5:7b
-  python RAG_prototype_wordaware.py --data_dir ./docs --backend hf --model Qwen/Qwen2.5-7B-Instruct --device cuda
+  python RAG_prototype_wordaware.py --data_dir ./docs --questions_file ./questions.txt --backend ollama --model Qwen2.5:3b
+  python RAG_prototype_wordaware.py --data_dir ./docs --backend hf --model Qwen/Qwen2.5-3B-Instruct --device cuda
 """
-from __future__ import annotations
-import argparse
-import json
 
-import re
-
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
-
-from docx import Document
-from razdel import sentenize, tokenize
-from rank_bm25 import BM25Okapi
-import numpy as np
-
-from sentence_transformers import SentenceTransformer, CrossEncoder
-import faiss
 
 # -----------------------------
 # Data models
@@ -90,21 +114,22 @@ def extract_locator(text: str) -> Dict[str, Optional[str]]:
 # -----------------------------
 
 class DocxLoader:
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, max_chars: int = 1400):
         self.data_dir = Path(data_dir)
+        self.max_chars = max_chars
 
     def load(self) -> Tuple[List[Chunk], List[str]]:
         chunks: List[Chunk] = []
         doc_names: List[str] = []
         cid = 0
         for di, path in enumerate(sorted(self.data_dir.glob("*.docx"))):
-            doc = Document(str(path))
+            doc = docx.Document(str(path))
             shortname = self._shortname_from_filename(path.name)
             doc_names.append(shortname)
 
             # paragraphs → sentence-aware chunking
             para_texts = [normalize_text(p.text) for p in doc.paragraphs if p.text and p.text.strip()]
-            for ch_text in self._word_aware_chunk("\n".join(para_texts)):
+            for ch_text in self._word_aware_chunk("".join(para_texts), max_chars=self.max_chars):
                 loc = extract_locator(ch_text)
                 chunks.append(Chunk(id=cid, doc_id=di, doc_name=shortname, text=ch_text, kind="para", locator=loc))
                 cid += 1
@@ -188,7 +213,7 @@ class HybridIndex:
         self._bm25 = BM25Okapi(tokenized)
 
         # Embeddings
-        self._embedder = SentenceTransformer(self.embed_model_name)
+        self._embedder = SentenceTransformer(self.embed_model_name, device="cpu")
         self._embedder_max = 4096
         vectors = self._encode_passages([c.text for c in chunks])
         self.dim = vectors.shape[1]
@@ -243,8 +268,8 @@ class HybridIndex:
 # -----------------------------
 
 class Reranker:
-    def __init__(self, model: str = "jinaai/jina-reranker-v2-base-multilingual", device: Optional[str] = None):
-        # device: "cuda" | "cpu" | None (auto)
+    def __init__(self, model: str = "BAAI/bge-reranker-v2-m3", device: Optional[str] = "cpu"):
+        # Force reranker to CPU by default to save VRAM in Colab.
         self._ce = CrossEncoder(model, device=device)
 
     def rerank(self, query: str, docs: List[Chunk], top_k: int = 10) -> List[Chunk]:
@@ -262,7 +287,7 @@ class LLMBackend:
         raise NotImplementedError
 
 class OllamaBackend(LLMBackend):
-    def __init__(self, model: str = "Qwen2.5:7b", host: str = "http://localhost:11434"):
+    def __init__(self, model: str = "Qwen2.5:3b", host: str = "http://localhost:11434"):
         self.model = model
         self.host = host.rstrip("/")
         try:
@@ -285,7 +310,7 @@ class OllamaBackend(LLMBackend):
         return data.get("response", "")
 
 class HFLocalBackend(LLMBackend):
-    def __init__(self, model: str = "Qwen/Qwen2.5-7B-Instruct", device: Optional[str] = None, load_4bit: bool = False):
+    def __init__(self, model: str = "Qwen/Qwen2.5-3B-Instruct", device: Optional[str] = None, load_4bit: bool = False):
         from transformers import AutoModelForCausalLM, AutoTokenizer
         import torch
         self.torch = torch
@@ -298,7 +323,6 @@ class HFLocalBackend(LLMBackend):
             self.model = AutoModelForCausalLM.from_pretrained(model, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True)
 
     def generate(self, system: str, prompt: str, max_new_tokens: int = 128) -> str:
-        from transformers import TextStreamer
         import torch
         messages = [
             {"role": "system", "content": system},
@@ -311,7 +335,7 @@ class HFLocalBackend(LLMBackend):
             text = system + "\n" + prompt
         inputs = self.tok(text, return_tensors="pt").to(self.model.device)
         with torch.no_grad():
-            out = self.model.generate(**inputs, do_sample=False, max_new_tokens=max_new_tokens, temperature=0.0)
+            out = self.model.generate(**inputs, do_sample=False, max_new_tokens=max_new_tokens)
         gen = self.tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
         return gen
 
@@ -340,16 +364,31 @@ def build_context(chunks: List[Chunk]) -> str:
     return "\n".join(lines)
 
 class RAGEngine:
-    def __init__(self, data_dir: Path, backend: str = "ollama", model: str = "Qwen2.5:7b", device: Optional[str] = None):
+    def __init__(self, data_dir: Path, backend: str = "ollama", model: str = "Qwen2.5:3b", device: Optional[str] = None,
+                 reranker_device: str = "cpu", top_k_ctx: int = 6, chunk_chars: int = 1400, max_new_tokens: int = 128):
+
+        logger.info("Starting RAG | backend=%s | model=%s | device=%s", backend, model, device or "auto")
+
         self.data_dir = Path(data_dir)
         self.backend_kind = backend
         self.model_name = model
         self.device = device
+        self.top_k_ctx = top_k_ctx
+        self.max_new_tokens = max_new_tokens
+        self.chunk_chars = chunk_chars
 
-        loader = DocxLoader(self.data_dir)
+        loader = DocxLoader(self.data_dir, max_chars=self.chunk_chars)
         self.chunks, self.doc_names = loader.load()
+        logger.info("Loaded %d docs → %d chunks", len(self.doc_names), len(self.chunks))
         self.index = HybridIndex(self.chunks)
-        self.reranker = Reranker(device=device)
+        try:
+            dim = getattr(self.index, "dim", None)
+            if dim is not None:
+                logger.info("Index built: FAISS dim=%d", dim)
+        except Exception:
+            pass
+        self.reranker = Reranker(device=reranker_device)
+        logger.info("Reranker device=%s", reranker_device)
         if backend == "ollama":
             self.llm: LLMBackend = OllamaBackend(model=model)
         elif backend == "hf":
@@ -357,12 +396,12 @@ class RAGEngine:
         else:
             raise ValueError("backend must be 'ollama' or 'hf'")
 
-    def answer_one(self, question: str, top_k_ctx: int = 8) -> Dict[str, Any]:
+    def answer_one(self, question: str) -> Dict[str, Any]:
         cands = self.index.search(question, k_bm25=30, k_faiss=30, k_out=25)
-        top = self.reranker.rerank(question, cands, top_k=top_k_ctx)
+        top = self.reranker.rerank(question, cands, top_k=self.top_k_ctx)
         context = build_context(top)
         prompt = ANSWER_USER_PROMPT_TEMPLATE.format(question=question, context=context)
-        raw = self.llm.generate(ANSWER_SYSTEM_PROMPT, prompt, max_new_tokens=200)
+        raw = self.llm.generate(ANSWER_SYSTEM_PROMPT, prompt, max_new_tokens=self.max_new_tokens)
         # Try to parse JSON
         used_ids: List[int] = []
         answer_text = ""
@@ -418,17 +457,35 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", type=str, required=True, help="Directory with .docx files")
     ap.add_argument("--backend", type=str, default="ollama", choices=["ollama", "hf"], help="LLM backend")
-    ap.add_argument("--model", type=str, default="Qwen2.5:7b", help="Model name (e.g., 'Qwen2.5:7b' for Ollama or HF repo for --backend hf)")
-    ap.add_argument("--device", type=str, default=None, help="Device for reranker/HF ('cuda' or 'cpu')")
+    ap.add_argument("--model", type=str, default="Qwen2.5:3b", help="Model name (e.g., 'Qwen2.5:3b' for Ollama or HF repo for --backend hf)")
+    ap.add_argument("--device", type=str, default=None, help="Device for HF backend ('cuda' or 'cpu')")
+    ap.add_argument("--reranker_device", type=str, default="cpu", help="Device for cross-encoder reranker (cpu/cuda)")
+    ap.add_argument("--top_k_ctx", type=int, default=6, help="Number of chunks in final context after reranking")
+    ap.add_argument("--chunk_chars", type=int, default=1400, help="Max characters per sentence window chunk")
+    ap.add_argument("--max_new_tokens", type=int, default=128, help="Max new tokens for generation")
     ap.add_argument("--questions_file", type=str, default=None, help="Path to file with questions (one per line)")
+    ap.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level")
+
     args = ap.parse_args()
 
-    engine = RAGEngine(Path(args.data_dir), backend=args.backend, model=args.model, device=args.device)
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format='[%(levelname)s] %(message)s')
+    logger.setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
+    logger.info("CLI parsed: backend=%s model=%s device=%s", args.backend, args.model, args.device or "auto")
+
+    engine = RAGEngine(
+        Path(args.data_dir),
+        backend=args.backend,
+        model=args.model,
+        device=args.device,
+        reranker_device=args.reranker_device,
+        top_k_ctx=args.top_k_ctx,
+        chunk_chars=args.chunk_chars,
+        max_new_tokens=args.max_new_tokens,
+    )
 
     if args.questions_file and Path(args.questions_file).exists():
         questions = [q.strip() for q in Path(args.questions_file).read_text(encoding='utf-8').splitlines() if q.strip()]
     else:
-        # Default: the 10 questions from the assignment
         questions = [
             "В каких зонах по весу снежного покрова находятся Херсон и Мелитополь?",
             "Какие регионы Российской Федерации имеют высотный коэффициент k_h, превышающий 2?",
@@ -439,7 +496,8 @@ def main():
             "Какая максимальная скорость движения подземных машин в выработках?",
             "Какая максимальная температура допускается в горных выработках?",
             "Какие допустимые значения по отклонению геометрических параметров сечения горных выработок?",
-            "В каком пункте указана минимальная толщина защитного слоя бетона для арматуры при креплении стволов монолитной бетонной крепью?",
+            "В каком пункте указана минимальная толщина защитного слоя бетона для арматуры при креплении стволов "
+            "монолитной бетонной крепью?",
         ]
 
     results = []
@@ -448,7 +506,7 @@ def main():
         out = engine.answer_one(q)
         out["latency_sec"] = round(time.time() - t0, 3)
         results.append(out)
-        print("\nQ:", q)
+        print("Q:", q)
         print("A:", out["answer"])
         print("Источники:")
         for c in out["citations"]:
@@ -457,7 +515,7 @@ def main():
     ts = time.strftime("%Y%m%d_%H%M%S")
     out_path = Path(f"results_{ts}.json")
     Path(out_path).write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
-    print(f"\nSaved to {out_path}")
+    print(f"Saved to {out_path}")
 
 
 if __name__ == "__main__":
