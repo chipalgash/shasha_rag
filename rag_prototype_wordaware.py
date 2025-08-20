@@ -30,11 +30,13 @@ warnings.filterwarnings("ignore")
 # noinspection PyBroadException
 try:
     from transformers.utils import logging as hf_logging
+
     hf_logging.set_verbosity_error()
 except Exception:
     pass
 
 import os
+
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
@@ -82,6 +84,7 @@ class Chunk:
             parts.append(self.locator["table"])
         return ", ".join(parts)
 
+
 # -----------------------------
 # Utilities
 # -----------------------------
@@ -108,6 +111,7 @@ def extract_locator(text: str) -> Dict[str, Optional[str]]:
     if m2:
         table = m2.group(0)
     return {"clause": clause, "table": table}
+
 
 # -----------------------------
 # DOCX loader (paragraphs + tables)
@@ -145,14 +149,17 @@ class DocxLoader:
                         # also create a header chunk (helps retrieval)
                         if header and header.strip():
                             loc = extract_locator(header)
-                            chunks.append(Chunk(id=cid, doc_id=di, doc_name=shortname, text=f"[Таблица]\n{header}", kind="table", locator=loc))
+                            chunks.append(
+                                Chunk(id=cid, doc_id=di, doc_name=shortname, text=f"[Таблица]\n{header}", kind="table",
+                                      locator=loc))
                             cid += 1
                         continue
                     row_text = " | ".join(cell.text.strip() for cell in row.cells)
                     row_text = normalize_text(row_text)
                     combined = (f"[Таблица]\n{header}\n{row_text}" if header else f"[Таблица]\n{row_text}")
                     loc = extract_locator(combined)
-                    chunks.append(Chunk(id=cid, doc_id=di, doc_name=shortname, text=combined, kind="table", locator=loc))
+                    chunks.append(
+                        Chunk(id=cid, doc_id=di, doc_name=shortname, text=combined, kind="table", locator=loc))
                     cid += 1
         return chunks, doc_names
 
@@ -160,7 +167,7 @@ class DocxLoader:
     def _shortname_from_filename(fname: str) -> str:
         # e.g. "СП 20.13330.2016 Нагрузки...docx" → "СП 20.13330.2016"
         base = Path(fname).stem
-        m = re.match(r"^([^\s]+\s*[^\s]+)\b", base)
+        m = re.match(r"^(\S+\s*\S+)\b", base)
         return m.group(1) if m else base
 
     @staticmethod
@@ -198,12 +205,15 @@ class DocxLoader:
             i = max(j - overlap_sents, j)
         return res
 
+
 # -----------------------------
 # Indexes: BM25 + FAISS + RRF
 # -----------------------------
 
 class HybridIndex:
-    def __init__(self, chunks: List[Chunk], embed_model: str = "intfloat/multilingual-e5-large-instruct", faiss_path: Optional[Path] = None):
+    # noinspection PyArgumentList
+    def __init__(self, chunks: List[Chunk], embed_model: str = "intfloat/multilingual-e5-base",
+                 faiss_path: Optional[Path] = None):
         self.chunks = chunks
         self.embed_model_name = embed_model
         self.faiss_path = Path(faiss_path) if faiss_path else None
@@ -213,14 +223,26 @@ class HybridIndex:
         self._bm25 = BM25Okapi(tokenized)
 
         # Embeddings
-        self._embedder = SentenceTransformer(self.embed_model_name, device="cpu")
+        # GPU если доступен (иначе CPU) + короткий принт, чтобы видеть устройство
+        # noinspection PyBroadException
+        try:
+            import torch
+            _dev = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            _dev = "cpu"
+
+        self._embedder = SentenceTransformer(self.embed_model_name, device=_dev)
+        print(f"[emb] {self.embed_model_name} on {_dev}")
         self._embedder_max = 4096
         vectors = self._encode_passages([c.text for c in chunks])
         self.dim = vectors.shape[1]
 
         # FAISS (cosine via inner product on normalized vectors)
         self._faiss = faiss.IndexFlatIP(self.dim)
-        self._faiss.add(vectors)
+        import numpy as _np
+        vectors = _np.asarray(vectors, dtype=_np.float32)
+        # noinspection PyArgumentList
+        self._faiss.add(_np.ascontiguousarray(vectors))
         if self.faiss_path:
             faiss.write_index(self._faiss, str(self.faiss_path))
 
@@ -231,17 +253,31 @@ class HybridIndex:
             # e5-instruct expects "passage: " prefix
             batch.append(f"passage: {t[:self._embedder_max]}")
             if len(batch) == 64:
-                e = self._embedder.encode(batch, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
+                e = self._embedder.encode(
+                    batch,
+                    normalize_embeddings=True,
+                    convert_to_numpy=True,
+                    show_progress_bar=True,
+                    batch_size=64
+                )
                 embs.append(e)
                 batch = []
         if batch:
-            e = self._embedder.encode(batch, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
+            e = self._embedder.encode(
+                batch,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=True,
+                batch_size=64
+            )
             embs.append(e)
         return np.vstack(embs)
 
     def _encode_query(self, q: str) -> np.ndarray:
-        return self._embedder.encode([f"query: {q}"], normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)[0]
+        return self._embedder.encode([f"query: {q}"], normalize_embeddings=True, convert_to_numpy=True,
+                                     show_progress_bar=False)[0]
 
+    # noinspection PyArgumentList
     def search(self, query: str, k_bm25: int = 30, k_faiss: int = 30, k_out: int = 25) -> List[Chunk]:
         # BM25
         bm25_scores = self._bm25.get_scores([t.text for t in tokenize(query.lower())])
@@ -249,9 +285,12 @@ class HybridIndex:
 
         # FAISS
         qv = self._encode_query(query)
-        D, I = self._faiss.search(qv.reshape(1, -1), k_faiss)
-        faiss_scores = D[0]
-        faiss_idx = I[0]
+        import numpy as _np
+        qv = _np.asarray(qv, dtype=_np.float32).reshape(1, -1)
+        # noinspection PyArgumentList
+        d, i = self._faiss.search(_np.ascontiguousarray(qv), k_faiss)
+        faiss_scores = d[0],
+        faiss_idx = i[0]
 
         # RRF merge
         runs = [list(top_bm_idx), list(faiss_idx)]
@@ -262,6 +301,7 @@ class HybridIndex:
                 rrf_scores[idx] = rrf_scores.get(idx, 0.0) + 1.0 / (K + rank)
         merged = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:k_out]
         return [self.chunks[i] for i, _ in merged]
+
 
 # -----------------------------
 # Re-ranker (cross-encoder)
@@ -278,6 +318,7 @@ class Reranker:
         order = np.argsort(scores)[::-1][:top_k]
         return [docs[i] for i in order]
 
+
 # -----------------------------
 # LLM backends
 # -----------------------------
@@ -285,6 +326,7 @@ class Reranker:
 class LLMBackend:
     def generate(self, system: str, prompt: str, max_new_tokens: int = 128) -> str:
         raise NotImplementedError
+
 
 class OllamaBackend(LLMBackend):
     def __init__(self, model: str = "Qwen2.5:3b", host: str = "http://localhost:11434"):
@@ -309,6 +351,7 @@ class OllamaBackend(LLMBackend):
         data = r.json()
         return data.get("response", "")
 
+
 class HFLocalBackend(LLMBackend):
     def __init__(self, model: str = "Qwen/Qwen2.5-3B-Instruct", device: Optional[str] = None, load_4bit: bool = False):
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -318,9 +361,11 @@ class HFLocalBackend(LLMBackend):
         if load_4bit:
             from transformers import BitsAndBytesConfig
             bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
-            self.model = AutoModelForCausalLM.from_pretrained(model, device_map="auto", quantization_config=bnb, torch_dtype=torch.bfloat16, trust_remote_code=True)
+            self.model = AutoModelForCausalLM.from_pretrained(model, device_map="auto", quantization_config=bnb,
+                                                              torch_dtype=torch.bfloat16, trust_remote_code=True)
         else:
-            self.model = AutoModelForCausalLM.from_pretrained(model, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True)
+            self.model = AutoModelForCausalLM.from_pretrained(model, device_map="auto", torch_dtype=torch.bfloat16,
+                                                              trust_remote_code=True)
 
     def generate(self, system: str, prompt: str, max_new_tokens: int = 128) -> str:
         import torch
@@ -339,6 +384,7 @@ class HFLocalBackend(LLMBackend):
         gen = self.tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
         return gen
 
+
 # -----------------------------
 # Orchestrator
 # -----------------------------
@@ -355,6 +401,7 @@ ANSWER_USER_PROMPT_TEMPLATE = (
     "Верни строго JSON без лишнего текста."
 )
 
+
 def build_context(chunks: List[Chunk]) -> str:
     lines = []
     for c in chunks:
@@ -362,6 +409,7 @@ def build_context(chunks: List[Chunk]) -> str:
         body = c.text
         lines.append(f"{head}\n{body}\n")
     return "\n".join(lines)
+
 
 class RAGEngine:
     def __init__(self, data_dir: Path, backend: str = "ollama", model: str = "Qwen2.5:3b", device: Optional[str] = None,
@@ -416,6 +464,7 @@ class RAGEngine:
         citations = unique_citations(self.chunks, used_ids)
         return {"question": question, "answer": answer_text, "citations": citations}
 
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -425,7 +474,7 @@ def extract_json(s: str) -> str:
     start = s.find("{")
     end = s.rfind("}")
     if start != -1 and end != -1 and end > start:
-        return s[start:end+1]
+        return s[start:end + 1]
     return s
 
 
@@ -449,6 +498,7 @@ def unique_citations(chunks: List[Chunk], ids: List[int]) -> List[Dict[str, str]
         out.append(item)
     return out
 
+
 # -----------------------------
 # CLI
 # -----------------------------
@@ -457,18 +507,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", type=str, required=True, help="Directory with .docx files")
     ap.add_argument("--backend", type=str, default="ollama", choices=["ollama", "hf"], help="LLM backend")
-    ap.add_argument("--model", type=str, default="Qwen2.5:3b", help="Model name (e.g., 'Qwen2.5:3b' for Ollama or HF repo for --backend hf)")
+    ap.add_argument("--model", type=str, default="Qwen2.5:3b",
+                    help="Model name (e.g., 'Qwen2.5:3b' for Ollama or HF repo for --backend hf)")
     ap.add_argument("--device", type=str, default=None, help="Device for HF backend ('cuda' or 'cpu')")
     ap.add_argument("--reranker_device", type=str, default="cpu", help="Device for cross-encoder reranker (cpu/cuda)")
     ap.add_argument("--top_k_ctx", type=int, default=6, help="Number of chunks in final context after reranking")
     ap.add_argument("--chunk_chars", type=int, default=1400, help="Max characters per sentence window chunk")
     ap.add_argument("--max_new_tokens", type=int, default=128, help="Max new tokens for generation")
     ap.add_argument("--questions_file", type=str, default=None, help="Path to file with questions (one per line)")
-    ap.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level")
+    ap.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                    help="Logging level")
 
     args = ap.parse_args()
 
-    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format='[%(levelname)s] %(message)s')
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO),
+                        format='[%(levelname)s] %(message)s')
     logger.setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
     logger.info("CLI parsed: backend=%s model=%s device=%s", args.backend, args.model, args.device or "auto")
 
