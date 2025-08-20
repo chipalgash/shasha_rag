@@ -133,7 +133,7 @@ class DocxLoader:
 
             # paragraphs → sentence-aware chunking
             para_texts = [normalize_text(p.text) for p in doc.paragraphs if p.text and p.text.strip()]
-            for ch_text in self._word_aware_chunk("".join(para_texts), max_chars=self.max_chars):
+            for ch_text in self._word_aware_chunk("\n".join(para_texts), max_chars=self.max_chars):
                 loc = extract_locator(ch_text)
                 chunks.append(Chunk(id=cid, doc_id=di, doc_name=shortname, text=ch_text, kind="para", locator=loc))
                 cid += 1
@@ -287,7 +287,7 @@ class HybridIndex:
         import numpy as _np
         qv = _np.asarray(qv, dtype=_np.float32).reshape(1, -1)
         D, I = self._faiss.search(_np.ascontiguousarray(qv), k_faiss)
-        faiss_scores = D[0],
+        faiss_scores = D[0]
         faiss_idx = I[0]
 
         # RRF merge
@@ -388,10 +388,11 @@ class HFLocalBackend(LLMBackend):
 # -----------------------------
 
 ANSWER_SYSTEM_PROMPT = (
-    "Ты — строгий помощник по нормативной документации. Отвечай только по приведённому контексту. "
-    "Формат ответа — JSON с полями: {\"answer\": str, \"used_chunks\": [int, ...]}. "
-    "Требования: 1) ответ кратко (1–2 предложения), 2) по-русски, 3) при наличии укажи номера пунктов/таблиц в самом ответе, "
-    "4) если данных недостаточно — верни 'Недостаточно информации'."
+    "Ты — строгий помощник по нормативной документации. Отвечай ТОЛЬКО по приведённому контексту.\n"
+    "Верни РОВНО один JSON-объект без комментариев, кода и дополнительного текста.\n"
+    "Формат: {\"answer\": str, \"used_chunks\": [int, ...]}.\n"
+    "Требования: 1) кратко (1–2 предложения), 2) по-русски, 3) если есть — номера пунктов/таблиц в тексте ответа,\n"
+    "4) если данных недостаточно — верни \"Недостаточно информации\"."
 )
 
 ANSWER_USER_PROMPT_TEMPLATE = (
@@ -443,12 +444,13 @@ class RAGEngine:
             raise ValueError("backend must be 'ollama' or 'hf'")
 
     def answer_one(self, question: str) -> Dict[str, Any]:
+        # первый проход
         cands = self.index.search(question, k_bm25=30, k_faiss=30, k_out=25)
         top = self.reranker.rerank(question, cands, top_k=self.top_k_ctx)
         context = build_context(top)
         prompt = ANSWER_USER_PROMPT_TEMPLATE.format(question=question, context=context)
         raw = self.llm.generate(ANSWER_SYSTEM_PROMPT, prompt, max_new_tokens=self.max_new_tokens)
-        # Try to parse JSON
+
         used_ids: List[int] = []
         answer_text = ""
         try:
@@ -456,10 +458,27 @@ class RAGEngine:
             answer_text = obj.get("answer", "").strip()
             used_ids = [int(x) for x in obj.get("used_chunks", [])]
         except Exception:
-            # Fallback: use top-3 IDs
             answer_text = raw.strip()
             used_ids = [c.id for c in top[:3]]
-        citations = unique_citations(self.chunks, used_ids)
+
+        # если модель «засомневалась» — даем больше контекста и пробуем ещё раз
+        need_retry = (not answer_text) or ("недостаточно информации" in answer_text.lower())
+        if need_retry:
+            top2 = self.reranker.rerank(question, cands, top_k=min(len(cands), max(self.top_k_ctx * 2, 10)))
+            context2 = build_context(top2)
+            prompt2 = ANSWER_USER_PROMPT_TEMPLATE.format(question=question, context=context2)
+            raw2 = self.llm.generate(ANSWER_SYSTEM_PROMPT, prompt2, max_new_tokens=self.max_new_tokens)
+            try:
+                obj2 = json.loads(extract_json(raw2))
+                answer_text2 = obj2.get("answer", "").strip()
+                used_ids2 = [int(x) for x in obj2.get("used_chunks", [])]
+                if answer_text2:
+                    answer_text, used_ids = answer_text2, used_ids2
+            except Exception:
+                # если опять не json — просто используем расширенный набор id
+                used_ids = [c.id for c in top2[:3]]
+
+        citations = unique_citations(self.chunks, used_ids if used_ids else [c.id for c in top[:3]])
         return {"question": question, "answer": answer_text, "citations": citations}
 
 
@@ -505,21 +524,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", type=str, required=True, help="Directory with .docx files")
     ap.add_argument("--backend", type=str, default="ollama", choices=["ollama", "hf"], help="LLM backend")
-    ap.add_argument("--model", type=str, default="Qwen2.5:3b",
-                    help="Model name (e.g., 'Qwen2.5:3b' for Ollama or HF repo for --backend hf)")
+    ap.add_argument("--model", type=str, default="Qwen2.5:3b", help="Model name (e.g., 'Qwen2.5:3b' for Ollama or HF repo for --backend hf)")
     ap.add_argument("--device", type=str, default=None, help="Device for HF backend ('cuda' or 'cpu')")
     ap.add_argument("--reranker_device", type=str, default="cpu", help="Device for cross-encoder reranker (cpu/cuda)")
     ap.add_argument("--top_k_ctx", type=int, default=6, help="Number of chunks in final context after reranking")
     ap.add_argument("--chunk_chars", type=int, default=1400, help="Max characters per sentence window chunk")
     ap.add_argument("--max_new_tokens", type=int, default=128, help="Max new tokens for generation")
     ap.add_argument("--questions_file", type=str, default=None, help="Path to file with questions (one per line)")
-    ap.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-                    help="Logging level")
+    ap.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level")
 
     args = ap.parse_args()
 
-    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO),
-                        format='[%(levelname)s] %(message)s')
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format='[%(levelname)s] %(message)s')
     logger.setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
     logger.info("CLI parsed: backend=%s model=%s device=%s", args.backend, args.model, args.device or "auto")
 
