@@ -56,8 +56,8 @@ Run (local minimal):
   # Optional HF 4-bit on Colab: bitsandbytes accelerate
 
 Examples:
-  python RAG_prototype_wordaware.py --data_dir ./docs --questions_file ./questions.txt --backend ollama --model Qwen2.5:3b
-  python RAG_prototype_wordaware.py --data_dir ./docs --backend hf --model Qwen/Qwen2.5-3B-Instruct --device cuda
+  python rag_prototype_wordaware.py --data_dir ./docs --questions_file ./questions.txt --backend ollama --model Qwen2.5:3b
+  python rag_prototype_wordaware.py --data_dir ./docs --backend hf --model Qwen/Qwen2.5-3B-Instruct --device cuda
 """
 
 
