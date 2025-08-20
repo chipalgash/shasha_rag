@@ -241,7 +241,6 @@ class HybridIndex:
         self._faiss = faiss.IndexFlatIP(self.dim)
         import numpy as _np
         vectors = _np.asarray(vectors, dtype=_np.float32)
-        # noinspection PyArgumentList
         self._faiss.add(_np.ascontiguousarray(vectors))
         if self.faiss_path:
             faiss.write_index(self._faiss, str(self.faiss_path))
@@ -287,10 +286,9 @@ class HybridIndex:
         qv = self._encode_query(query)
         import numpy as _np
         qv = _np.asarray(qv, dtype=_np.float32).reshape(1, -1)
-        # noinspection PyArgumentList
-        d, i = self._faiss.search(_np.ascontiguousarray(qv), k_faiss)
-        faiss_scores = d[0],
-        faiss_idx = i[0]
+        D, I = self._faiss.search(_np.ascontiguousarray(qv), k_faiss)
+        faiss_scores = D[0],
+        faiss_idx = I[0]
 
         # RRF merge
         runs = [list(top_bm_idx), list(faiss_idx)]
